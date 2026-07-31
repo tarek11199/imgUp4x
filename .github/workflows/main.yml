@@ -1,0 +1,62 @@
+name: Playwright VanceAI Login
+
+on:
+  workflow_dispatch: # Allows manual trigger from the GitHub Actions UI with custom options
+    inputs:
+      scale:
+        description: 'Upscale Scale Factor'
+        required: true
+        default: '2x'
+        type: choice
+        options:
+          - '2x'
+          - '4x'
+          - '8x'
+      output_format:
+        description: 'Upscaled Image Output Format'
+        required: true
+        default: 'jpg'
+        type: choice
+        options:
+          - 'jpg'
+          - 'png'
+      zip_url:
+        description: 'URL of the ZIP file containing wallpapers (optional if input.zip is committed to the repo)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  run-browser:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
+    - name: Install npm dependencies
+      run: npm install
+
+    - name: Install Playwright Browsers and System Dependencies
+      run: npx playwright install --with-deps chromium
+
+    - name: Run Playwright Script with Xvfb (non-headless)
+      # xvfb-run executes the Node script inside a virtual display environment.
+      # This satisfies the browser's requirement for a display device when headless: false is set.
+      env:
+        SCALE: ${{ github.event.inputs.scale || '2x' }}
+        OUTPUT_FORMAT: ${{ github.event.inputs.output_format || 'jpg' }}
+        ZIP_URL: ${{ github.event.inputs.zip_url }}
+      run: xvfb-run --auto-servernum --server-args="-screen 0 1280x960x24" node login.js
+
+    - name: Upload upscaled images as workflow artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: playwright-artifacts
+        path: output.zip
