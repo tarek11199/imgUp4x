@@ -1,11 +1,19 @@
-name: HyperFrames temporary preview
-run-name: HyperFrames preview (${{ inputs.minutes }} minutes)
+name: Remotion Studio and render
+run-name: Remotion ${{ inputs.mode }}
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: studio = Live Panel (edit code + Studio preview + render in one page); render = make the MP4 directly
+        type: choice
+        required: true
+        default: studio
+        options:
+          - studio
+          - render
       minutes:
-        description: Preview session length (uses Actions minutes)
+        description: Studio session length after startup (studio mode only)
         type: choice
         required: true
         default: '330'
@@ -13,16 +21,21 @@ on:
           - '330'
           - '60'
           - '30'
+      composition:
+        description: Composition ID to render (render mode only)
+        type: string
+        required: true
+        default: Main
 
 permissions:
   contents: read
 
 concurrency:
-  group: hyperframes-preview
+  group: remotion-${{ inputs.mode }}
   cancel-in-progress: false
 
 jobs:
-  preview:
+  remotion:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     defaults:
@@ -30,8 +43,7 @@ jobs:
         shell: bash
     env:
       CI: 'true'
-      HYPERFRAMES_SKIP_SKILLS: '1'
-      PROJECT_DIR: ${{ github.workspace }}/my-video
+      PROJECT_DIR: ${{ github.workspace }}/my-remotion
 
     steps:
       - name: Check out your project repository
@@ -44,27 +56,137 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install HyperFrames and check FFmpeg
-        timeout-minutes: 8
+      - name: Create starter project if my-remotion is missing
         run: |
           set -euo pipefail
-          if command -v ffmpeg >/dev/null 2>&1; then
-            echo 'Using FFmpeg already installed on the runner.'
-          else
-            echo 'Installing FFmpeg (maximum 3 minutes).'
-            if ! sudo timeout --kill-after=10s 180s bash -c '
-              set -euo pipefail
-              apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
-              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends ffmpeg
-            '; then
-              echo '::error::FFmpeg installation failed or exceeded 3 minutes. No app session was started. Check the package mirror and rerun.'
-              exit 1
-            fi
+          if [[ -f "$PROJECT_DIR/package.json" ]]; then
+            echo 'Using your my-remotion project from the repository.'
+            exit 0
           fi
-          npm install --global --no-audit --no-fund hyperframes@0.8.188
-          hyperframes --version
+          echo '::notice::No my-remotion folder found. Creating a starter project. Commit it to your repo to keep your code.'
+          mkdir -p "$PROJECT_DIR/src"
+          cat > "$PROJECT_DIR/package.json" <<'EOF'
+          {
+            "name": "my-remotion",
+            "private": true,
+            "type": "module",
+            "scripts": {
+              "studio": "remotion studio src/index.ts",
+              "render": "remotion render src/index.ts"
+            },
+            "dependencies": {
+              "@remotion/cli": "4.0.538",
+              "react": "19.1.0",
+              "react-dom": "19.1.0",
+              "remotion": "4.0.538"
+            },
+            "devDependencies": {
+              "@types/react": "19.1.8",
+              "typescript": "5.8.3"
+            }
+          }
+          EOF
+          cat > "$PROJECT_DIR/tsconfig.json" <<'EOF'
+          {
+            "compilerOptions": {
+              "target": "ES2022",
+              "module": "ESNext",
+              "moduleResolution": "Bundler",
+              "jsx": "react-jsx",
+              "strict": true,
+              "skipLibCheck": true,
+              "noEmit": true
+            },
+            "include": ["src"]
+          }
+          EOF
+          cat > "$PROJECT_DIR/src/index.ts" <<'EOF'
+          import { registerRoot } from "remotion";
+          import { RemotionRoot } from "./Root";
+
+          registerRoot(RemotionRoot);
+          EOF
+          cat > "$PROJECT_DIR/src/Root.tsx" <<'EOF'
+          import { Composition } from "remotion";
+          import { Main } from "./Main";
+
+          // Change size, fps and length here. Example vertical 3K: width 1620, height 2880.
+          export const RemotionRoot: React.FC = () => {
+            return (
+              <Composition
+                id="Main"
+                component={Main}
+                durationInFrames={300}
+                fps={30}
+                width={1920}
+                height={1080}
+              />
+            );
+          };
+          EOF
+          cat > "$PROJECT_DIR/src/Main.tsx" <<'EOF'
+          import { AbsoluteFill, interpolate, spring, useCurrentFrame, useVideoConfig } from "remotion";
+
+          export const Main: React.FC = () => {
+            const frame = useCurrentFrame();
+            const { fps, width, height } = useVideoConfig();
+            const u = Math.min(width, height) / 1080;
+
+            // Ball drops with a real spring bounce
+            const drop = spring({ frame, fps, config: { damping: 9, stiffness: 120, mass: 1 } });
+            const ballY = interpolate(drop, [0, 1], [-300 * u, height * 0.55]);
+            const glow = interpolate(Math.sin((frame / fps) * Math.PI), [-1, 1], [0.4, 1]);
+
+            return (
+              <AbsoluteFill style={{ background: "radial-gradient(circle at 50% 40%, #2a1060, #07031a 70%)" }}>
+                <div
+                  style={{
+                    position: "absolute",
+                    left: width / 2 - 90 * u,
+                    top: ballY - 90 * u,
+                    width: 180 * u,
+                    height: 180 * u,
+                    borderRadius: "50%",
+                    background: "radial-gradient(circle at 35% 30%, #ffffff, #22d3ee 45%, #0e7490)",
+                    boxShadow: `0 0 ${80 * u * glow}px ${20 * u * glow}px rgba(34,211,238,0.6)`,
+                  }}
+                />
+              </AbsoluteFill>
+            );
+          };
+          EOF
+
+      - name: Install Remotion (bundled FFmpeg, no apt install)
+        timeout-minutes: 10
+        working-directory: my-remotion
+        run: |
+          set -euo pipefail
+          if [[ -f package-lock.json ]]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+          npx remotion versions
+          npx remotion browser ensure
+
+      - name: Render MP4
+        if: ${{ inputs.mode == 'render' }}
+        working-directory: my-remotion
+        env:
+          COMPOSITION: ${{ inputs.composition }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$COMPOSITION" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo '::error::Composition ID may only contain letters, numbers, - and _.'
+            exit 1
+          fi
+          npx remotion compositions src/index.ts
+          npx remotion render src/index.ts "$COMPOSITION" "out/$COMPOSITION.mp4"
+          ls -lh out/
+          echo "Rendered out/$COMPOSITION.mp4. Download it from the remotion-output artifact." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Install pinned Cloudflare client
+        if: ${{ inputs.mode == 'studio' }}
         run: |
           set -euo pipefail
           curl --fail --location --retry 3 \
@@ -74,54 +196,706 @@ jobs:
           chmod +x "$RUNNER_TEMP/cloudflared"
           "$RUNNER_TEMP/cloudflared" version
 
-      - name: Prepare video project
+      - name: Write Live Panel files
+        if: ${{ inputs.mode == 'studio' }}
         run: |
-          set -euo pipefail
-          if [[ ! -d "$PROJECT_DIR" ]]; then
-            hyperframes init "$PROJECT_DIR" --non-interactive
-          fi
-          if [[ ! -f "$PROJECT_DIR/index.html" ]]; then
-            echo '::error::my-video exists but has no index.html. Add a valid HyperFrames project.'
-            exit 1
-          fi
+          mkdir -p "$RUNNER_TEMP/panel"
+          cat > "$RUNNER_TEMP/panel/server.mjs" <<'PANEL_SERVER_EOF'
+          // Remotion Live Panel: editor + Studio preview + render, behind one port.
+          import http from 'node:http';
+          import net from 'node:net';
+          import fs from 'node:fs';
+          import fsp from 'node:fs/promises';
+          import path from 'node:path';
+          import os from 'node:os';
+          import crypto from 'node:crypto';
+          import { spawn } from 'node:child_process';
+          import { createRequire } from 'node:module';
+          import { fileURLToPath } from 'node:url';
 
-      - name: Start browser session
+          const HERE = path.dirname(fileURLToPath(import.meta.url));
+          const PROJECT = path.resolve(process.env.PROJECT_DIR || process.cwd());
+          const SRC = path.join(PROJECT, 'src');
+          const OUT = path.join(PROJECT, 'out');
+          const PORT = Number(process.env.PANEL_PORT || 3000);
+          const STUDIO_PORT = Number(process.env.STUDIO_PORT || 3001);
+          const SESSION_END = Number(process.env.SESSION_END || 0);
+          const PASSWORD = process.env.PANEL_PASSWORD || '';
+          const GH_TOKEN = process.env.GH_TOKEN || '';
+          const REPO = process.env.GITHUB_REPOSITORY || '';
+          const REF = process.env.GITHUB_REF_NAME || '';
+          const WORKSPACE = process.env.GITHUB_WORKSPACE || path.dirname(PROJECT);
+          const SESSION_TOKEN = crypto.randomBytes(32).toString('hex');
+          const PAGE = fs.readFileSync(path.join(HERE, 'panel.html'), 'utf8');
+
+          const req = createRequire(path.join(PROJECT, 'package.json'));
+          let bundler = null, renderer = null;
+          function loadRemotion() {
+            if (!bundler) bundler = req('@remotion/bundler');
+            if (!renderer) renderer = req('@remotion/renderer');
+          }
+
+          // ---------- helpers ----------
+          function send(res, code, body, type = 'application/json; charset=utf-8', extra = {}) {
+            const data = typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body);
+            res.writeHead(code, { 'content-type': type, 'cache-control': 'no-store', ...extra });
+            res.end(data);
+          }
+          function readBody(r, limit = 2 * 1024 * 1024) {
+            return new Promise((resolve, reject) => {
+              const chunks = []; let n = 0;
+              r.on('data', c => { n += c.length; if (n > limit) { reject(new Error('Body too large')); r.destroy(); } else chunks.push(c); });
+              r.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+              r.on('error', reject);
+            });
+          }
+          function cookies(r) {
+            const o = {};
+            (r.headers.cookie || '').split(';').forEach(p => { const i = p.indexOf('='); if (i > 0) o[p.slice(0, i).trim()] = decodeURIComponent(p.slice(i + 1).trim()); });
+            return o;
+          }
+          function authed(r) {
+            if (!PASSWORD) return true;
+            const c = cookies(r).rpanel || '';
+            return c.length === SESSION_TOKEN.length && crypto.timingSafeEqual(Buffer.from(c), Buffer.from(SESSION_TOKEN));
+          }
+          function safeSrcPath(rel) {
+            if (typeof rel !== 'string' || !/^[A-Za-z0-9_\-./]+$/.test(rel) || rel.includes('..')) return null;
+            const abs = path.resolve(PROJECT, rel);
+            if (!abs.startsWith(SRC + path.sep)) return null;
+            if (!/\.(tsx|ts|jsx|js|css|json)$/.test(abs)) return null;
+            return abs;
+          }
+          async function walk(dir, base = dir) {
+            let out = [];
+            for (const e of await fsp.readdir(dir, { withFileTypes: true }).catch(() => [])) {
+              if (e.name === 'node_modules' || e.name.startsWith('.')) continue;
+              const p = path.join(dir, e.name);
+              if (e.isDirectory()) out = out.concat(await walk(p, base));
+              else out.push(p);
+            }
+            return out;
+          }
+          function run(cmd, args, opts = {}) {
+            return new Promise(resolve => {
+              const p = spawn(cmd, args, { cwd: opts.cwd || PROJECT, env: { ...process.env, ...(opts.env || {}) } });
+              let out = '';
+              const t = setTimeout(() => { out += '\n[timed out]'; p.kill('SIGKILL'); }, opts.timeout || 180000);
+              p.stdout.on('data', d => { out += d; }); p.stderr.on('data', d => { out += d; });
+              p.on('close', code => { clearTimeout(t); resolve({ code, out }); });
+              p.on('error', e => { clearTimeout(t); resolve({ code: -1, out: String(e) }); });
+            });
+          }
+          const redact = s => (GH_TOKEN ? s.split(GH_TOKEN).join('***') : s);
+
+          // ---------- bundle cache + jobs ----------
+          let cache = { key: '', serveUrl: '' };
+          async function srcKey() {
+            const files = (await walk(SRC)).concat([path.join(PROJECT, 'package.json')]);
+            const h = crypto.createHash('sha1');
+            for (const f of files.sort()) { const s = await fsp.stat(f).catch(() => null); if (s) h.update(f + s.mtimeMs + ':' + s.size); }
+            return h.digest('hex');
+          }
+          async function getBundle(onProgress) {
+            loadRemotion();
+            const key = await srcKey();
+            if (cache.key === key && fs.existsSync(cache.serveUrl)) return cache.serveUrl;
+            const serveUrl = await bundler.bundle({ entryPoint: path.join(SRC, 'index.ts'), onProgress: p => onProgress && onProgress(p) });
+            const old = cache.serveUrl;
+            cache = { key, serveUrl };
+            if (old && old !== serveUrl) fsp.rm(old, { recursive: true, force: true }).catch(() => {});
+            return serveUrl;
+          }
+          let job = { status: 'idle' };
+          let cancel = null;
+          const busy = () => ['bundling', 'preparing', 'rendering'].includes(job.status);
+          const stamp = () => new Date().toISOString().replace(/[-:T]/g, '').slice(4, 14);
+
+          async function startRender(o) {
+            loadRemotion();
+            const id = String(o.composition || 'Main').replace(/[^A-Za-z0-9_-]/g, '') || 'Main';
+            const crf = { best: 16, high: 20, small: 26 }[o.quality] || 20;
+            const scale = [0.25, 0.5, 1, 2].includes(Number(o.scale)) ? Number(o.scale) : 1;
+            const name = `${id}-${stamp()}${o.test ? '-test' : ''}${scale !== 1 ? '-x' + scale : ''}.mp4`;
+            job = { status: 'bundling', progress: 0, stage: 'Bundling code…', started: Date.now(), file: name, composition: id };
+            try {
+              const serveUrl = await getBundle(p => { job.stage = `Bundling code… ${Math.round(p)}%`; });
+              job.status = 'preparing'; job.stage = 'Opening composition…';
+              const composition = await renderer.selectComposition({ serveUrl, id, inputProps: {} });
+              const last = composition.durationInFrames - 1;
+              const frameRange = o.test ? [0, Math.min(last, composition.fps * 3 - 1)] : null;
+              job.total = frameRange ? frameRange[1] + 1 : composition.durationInFrames;
+              job.meta = `${composition.width * scale} × ${composition.height * scale} · ${composition.fps} fps · ${job.total} frames`;
+              await fsp.mkdir(OUT, { recursive: true });
+              const c = renderer.makeCancelSignal(); cancel = c.cancel;
+              job.status = 'rendering'; job.stage = 'Rendering frames…';
+              await renderer.renderMedia({
+                composition, serveUrl, codec: 'h264', crf, scale, frameRange,
+                outputLocation: path.join(OUT, name), inputProps: {}, cancelSignal: c.cancelSignal,
+                onProgress: p => {
+                  job.progress = p.progress;
+                  job.stage = p.stitchStage === 'muxing' ? 'Finishing MP4…' : `Frames ${p.renderedFrames}/${job.total} · encoded ${p.encodedFrames}`;
+                },
+              });
+              job = { ...job, status: 'done', progress: 1, stage: 'Done', seconds: Math.round((Date.now() - job.started) / 1000) };
+            } catch (e) {
+              job = { ...job, status: job.status === 'cancelled' ? 'cancelled' : 'error', error: String(e && e.stack || e).slice(0, 4000) };
+              fsp.rm(path.join(OUT, name), { force: true }).catch(() => {});
+            } finally { cancel = null; }
+          }
+
+          // ---------- API ----------
+          async function api(r, res, url) {
+            const p = url.pathname.replace('/__panel/api/', '');
+            if (p === 'info') return send(res, 200, { sessionEnd: SESSION_END, github: !!(GH_TOKEN && REPO), repo: REPO, ref: REF, password: !!PASSWORD });
+            if (p === 'files') {
+              const files = (await walk(SRC)).map(f => path.relative(PROJECT, f).split(path.sep).join('/')).filter(f => safeSrcPath(f));
+              return send(res, 200, { files });
+            }
+            if (p === 'file') {
+              const abs = safeSrcPath(url.searchParams.get('path'));
+              if (!abs) return send(res, 400, { error: 'Invalid file path. Use src/Name.tsx' });
+              if (r.method === 'GET') {
+                const t = await fsp.readFile(abs, 'utf8').catch(() => null);
+                return t === null ? send(res, 404, { error: 'Not found' }) : send(res, 200, { content: t });
+              }
+              if (r.method === 'PUT') {
+                const body = await readBody(r);
+                await fsp.mkdir(path.dirname(abs), { recursive: true });
+                await fsp.writeFile(abs, body.replace(/\r\n/g, '\n'));
+                return send(res, 200, { ok: true });
+              }
+            }
+            if (p === 'check' && r.method === 'POST') {
+              const tsc = path.join(PROJECT, 'node_modules', '.bin', 'tsc');
+              if (!fs.existsSync(tsc)) return send(res, 200, { ok: false, out: 'TypeScript is not installed in this project (add "typescript" to devDependencies).' });
+              const x = await run(tsc, ['--noEmit', '-p', '.'], { timeout: 180000 });
+              return send(res, 200, { ok: x.code === 0, out: x.out.trim() || 'No TypeScript errors.' });
+            }
+            if (p === 'render' && r.method === 'POST') {
+              if (busy()) return send(res, 409, { error: 'A render is already running.' });
+              const o = JSON.parse((await readBody(r)) || '{}');
+              startRender(o);
+              return send(res, 202, { ok: true });
+            }
+            if (p === 'still' && r.method === 'POST') {
+              if (busy()) return send(res, 409, { error: 'Wait for the current render to finish.' });
+              const o = JSON.parse((await readBody(r)) || '{}');
+              loadRemotion();
+              const id = String(o.composition || 'Main').replace(/[^A-Za-z0-9_-]/g, '') || 'Main';
+              job = { status: 'bundling', progress: 0, stage: 'Bundling for snapshot…', started: Date.now() };
+              try {
+                const serveUrl = await getBundle(pr => { job.stage = `Bundling code… ${Math.round(pr)}%`; });
+                job = { status: 'preparing', stage: 'Rendering snapshot…', progress: 0 };
+                const composition = await renderer.selectComposition({ serveUrl, id, inputProps: {} });
+                const frame = Math.max(0, Math.min(composition.durationInFrames - 1, Math.round(Number(o.frame) || 0)));
+                await fsp.mkdir(OUT, { recursive: true });
+                const name = `still-${id}-f${frame}-${stamp()}.png`;
+                await renderer.renderStill({ composition, serveUrl, frame, output: path.join(OUT, name), inputProps: {} });
+                job = { status: 'idle' };
+                return send(res, 200, { ok: true, file: name, frame });
+              } catch (e) {
+                job = { status: 'idle' };
+                return send(res, 200, { ok: false, error: String(e && e.stack || e).slice(0, 4000) });
+              }
+            }
+            if (p === 'job') return send(res, 200, job);
+            if (p === 'cancel' && r.method === 'POST') { if (cancel) { job.status = 'cancelled'; cancel(); } return send(res, 200, { ok: true }); }
+            if (p === 'outputs') {
+              const list = [];
+              for (const f of await fsp.readdir(OUT).catch(() => [])) {
+                if (!/\.(mp4|mov|webm|gif|png|jpe?g|mp3|wav)$/i.test(f)) continue;
+                const s = await fsp.stat(path.join(OUT, f)).catch(() => null);
+                if (s && s.isFile()) list.push({ name: f, size: s.size, time: s.mtimeMs });
+              }
+              list.sort((a, b) => b.time - a.time);
+              return send(res, 200, { files: list });
+            }
+            if (p === 'delete' && r.method === 'POST') {
+              const name = path.basename(JSON.parse((await readBody(r)) || '{}').name || '');
+              if (!name || (busy() && name === job.file)) return send(res, 400, { error: 'Cannot delete this file now.' });
+              await fsp.rm(path.join(OUT, name), { force: true });
+              return send(res, 200, { ok: true });
+            }
+            if (p === 'commit' && r.method === 'POST') {
+              if (!GH_TOKEN || !REPO || !REF) return send(res, 200, { ok: false, out: 'GitHub saving is not available in this session.' });
+              const o = JSON.parse((await readBody(r)) || '{}');
+              const msg = String(o.message || '').trim().slice(0, 200) || 'Update animation from Remotion Live Panel';
+              const rel = path.relative(WORKSPACE, PROJECT) || '.';
+              const gi = path.join(PROJECT, '.gitignore');
+              if (!fs.existsSync(gi)) await fsp.writeFile(gi, 'node_modules/\nout/\n.cache/\n');
+              const remote = `https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git`;
+              const g = (...a) => run('git', a, { cwd: WORKSPACE, timeout: 120000 });
+              let log = '';
+              const step = async (...a) => { const x = await g(...a); log += `$ git ${a[0]} …\n${x.out}`; return x; };
+              await g('config', 'user.name', 'Remotion Live Panel');
+              await g('config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com');
+              await step('add', '--', `${rel}/src`, `${rel}/package.json`, `${rel}/tsconfig.json`, `${rel}/.gitignore`);
+              const diff = await g('diff', '--cached', '--quiet');
+              if (diff.code === 0) return send(res, 200, { ok: true, out: 'Nothing new to save. GitHub already has this code.' });
+              const c = await step('commit', '-m', msg);
+              if (c.code !== 0) return send(res, 200, { ok: false, out: redact(log) });
+              let push = await step('push', remote, `HEAD:refs/heads/${REF}`);
+              if (push.code !== 0) {
+                await step('pull', '--rebase', remote, REF);
+                push = await step('push', remote, `HEAD:refs/heads/${REF}`);
+              }
+              return send(res, 200, { ok: push.code === 0, out: redact(log) });
+            }
+            return send(res, 404, { error: 'Unknown API' });
+          }
+
+          function serveOut(r, res, url) {
+            const name = path.basename(decodeURIComponent(url.pathname.replace('/__panel/out/', '')));
+            const abs = path.join(OUT, name);
+            fs.stat(abs, (err, s) => {
+              if (err || !s.isFile()) return send(res, 404, 'Not found', 'text/plain');
+              const ext = path.extname(name).toLowerCase();
+              const type = { '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm', '.gif': 'image/gif', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.mp3': 'audio/mpeg', '.wav': 'audio/wav' }[ext] || 'application/octet-stream';
+              const headers = { 'content-type': type, 'accept-ranges': 'bytes', 'cache-control': 'no-store' };
+              if (url.searchParams.get('download')) headers['content-disposition'] = `attachment; filename="${name}"`;
+              const m = /bytes=(\d*)-(\d*)/.exec(r.headers.range || '');
+              if (m) {
+                const start = m[1] ? Number(m[1]) : 0, end = m[2] ? Math.min(Number(m[2]), s.size - 1) : s.size - 1;
+                if (start > end || start >= s.size) { res.writeHead(416, { 'content-range': `bytes */${s.size}` }); return res.end(); }
+                res.writeHead(206, { ...headers, 'content-range': `bytes ${start}-${end}/${s.size}`, 'content-length': end - start + 1 });
+                return fs.createReadStream(abs, { start, end }).pipe(res);
+              }
+              res.writeHead(200, { ...headers, 'content-length': s.size });
+              fs.createReadStream(abs).pipe(res);
+            });
+          }
+
+          // ---------- Studio proxy ----------
+          function proxy(r, res) {
+            const p = http.request({ host: '127.0.0.1', port: STUDIO_PORT, method: r.method, path: r.url, headers: r.headers }, pr => {
+              res.writeHead(pr.statusCode || 502, pr.headers);
+              pr.pipe(res);
+            });
+            p.on('error', () => { if (!res.headersSent) send(res, 502, '<p style="font:16px sans-serif;padding:24px">Remotion Studio is starting… reload in a few seconds.</p>', 'text/html; charset=utf-8'); else res.end(); });
+            r.pipe(p);
+          }
+
+          const LOGIN = err => `<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Remotion Live Panel</title><body style="margin:0;display:grid;place-items:center;height:100vh;background:#0b1020;color:#e2e8f0;font:16px system-ui"><form method="post" action="/__panel/login" style="background:#121a2e;padding:28px;border-radius:14px;width:300px;display:grid;gap:12px"><b style="font-size:18px">Remotion Live Panel</b>${err ? '<span style="color:#f87171">Wrong password</span>' : ''}<input name="password" type="password" placeholder="Panel password" autofocus style="padding:10px;border-radius:8px;border:1px solid #334155;background:#0b1020;color:#fff"><button style="padding:10px;border:0;border-radius:8px;background:#6366f1;color:#fff;font-weight:600">Open panel</button></form>`;
+
+          const server = http.createServer(async (r, res) => {
+            try {
+              const url = new URL(r.url, 'http://x');
+              if (url.pathname === '/__panel/health') return send(res, 200, 'ok', 'text/plain');
+              if (url.pathname === '/__panel/login') {
+                if (r.method === 'POST') {
+                  const pw = new URLSearchParams(await readBody(r, 10000)).get('password') || '';
+                  const a = crypto.createHash('sha256').update(pw).digest(), b = crypto.createHash('sha256').update(PASSWORD).digest();
+                  if (PASSWORD && crypto.timingSafeEqual(a, b)) return send(res, 302, '', 'text/plain', { location: '/__panel/', 'set-cookie': `rpanel=${SESSION_TOKEN}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400` });
+                  return send(res, 401, LOGIN(true), 'text/html; charset=utf-8');
+                }
+                return send(res, 200, LOGIN(false), 'text/html; charset=utf-8');
+              }
+              if (!authed(r)) {
+                if ((r.headers['sec-fetch-dest'] || 'document') === 'document' && r.method === 'GET') return send(res, 302, '', 'text/plain', { location: '/__panel/login' });
+                return send(res, 401, { error: 'Login required' });
+              }
+              if (url.pathname === '/__panel' || url.pathname === '/__panel/') return send(res, 200, PAGE, 'text/html; charset=utf-8');
+              if (url.pathname.startsWith('/__panel/api/')) return await api(r, res, url);
+              if (url.pathname.startsWith('/__panel/out/')) return serveOut(r, res, url);
+              // A normal page visit to "/" opens the panel; the iframe (and /?studio) gets Remotion Studio.
+              if (r.url === '/' && r.method === 'GET' && (r.headers['sec-fetch-dest'] || 'document') === 'document') return send(res, 302, '', 'text/plain', { location: '/__panel/' });
+              return proxy(r, res);
+            } catch (e) {
+              if (!res.headersSent) send(res, 500, { error: String(e && e.message || e) }); else res.end();
+            }
+          });
+          server.on('upgrade', (r, sock, head) => {
+            if (!authed(r)) { sock.end('HTTP/1.1 401 Unauthorized\r\n\r\n'); return; }
+            const up = net.connect(STUDIO_PORT, '127.0.0.1', () => {
+              let h = `${r.method} ${r.url} HTTP/${r.httpVersion}\r\n`;
+              for (let i = 0; i < r.rawHeaders.length; i += 2) h += `${r.rawHeaders[i]}: ${r.rawHeaders[i + 1]}\r\n`;
+              up.write(h + '\r\n'); if (head && head.length) up.write(head);
+              sock.pipe(up).pipe(sock);
+            });
+            up.on('error', () => sock.destroy()); sock.on('error', () => up.destroy());
+          });
+          server.requestTimeout = 0;
+          server.headersTimeout = 60000;
+          server.listen(PORT, '127.0.0.1', () => console.log(`Remotion Live Panel on http://127.0.0.1:${PORT}/__panel/ (Studio proxied from ${STUDIO_PORT}) cpus=${os.cpus().length}`));
+          PANEL_SERVER_EOF
+          cat > "$RUNNER_TEMP/panel/panel.html" <<'PANEL_HTML_EOF'
+          <!doctype html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>Remotion Live Panel</title>
+          <style>
+          :root{--bg:#0b1020;--card:#121a2e;--line:#243047;--text:#e2e8f0;--muted:#94a3b8;--acc:#6366f1;--ok:#22c55e;--bad:#f87171;--warn:#fbbf24}
+          *{box-sizing:border-box}
+          html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+          button,select,input,textarea{font:inherit;color:inherit}
+          button{background:#1e293b;border:1px solid var(--line);border-radius:8px;padding:7px 12px;cursor:pointer;white-space:nowrap}
+          button:hover{border-color:#475569}
+          a{color:inherit;text-decoration:none}
+          button.primary{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+          button.danger{color:var(--bad)}
+          button:disabled{opacity:.5;cursor:not-allowed}
+          select,input[type=text],input[type=number]{background:#0b1020;border:1px solid var(--line);border-radius:8px;padding:7px 9px}
+          header{height:52px;display:flex;align-items:center;gap:10px;padding:0 14px;border-bottom:1px solid var(--line);background:#0e1528}
+          header b{font-size:16px;margin-right:auto}
+          header .pill{color:var(--muted);font-size:13px}
+          main{display:grid;grid-template-columns:minmax(360px,44%) 1fr;height:calc(100vh - 52px)}
+          .col{display:flex;flex-direction:column;min-height:0;min-width:0}
+          .left{border-right:1px solid var(--line)}
+          .bar{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+          .bar .grow{flex:1}
+          #editor{flex:1;min-height:200px;position:relative}
+          #editor textarea{position:absolute;inset:0;width:100%;height:100%;resize:none;border:0;padding:12px;background:#0b1020;color:#dbeafe;font:13px/1.55 ui-monospace,Consolas,monospace;tab-size:2;outline:none}
+          #console{height:150px;overflow:auto;margin:0;padding:10px;border-top:1px solid var(--line);background:#070b16;font:12px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;color:var(--muted)}
+          #console.ok{color:#86efac}#console.bad{color:#fca5a5}
+          #studioWrap{flex:1;min-height:280px;position:relative;background:#000}
+          #studio{position:absolute;inset:0;width:100%;height:100%;border:0}
+          .render{max-height:46%;overflow:auto;border-top:1px solid var(--line);padding:12px;display:grid;gap:12px;background:var(--card)}
+          .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+          .row label{color:var(--muted);font-size:12px;display:grid;gap:3px}
+          .progress{height:10px;background:#1e293b;border-radius:99px;overflow:hidden}
+          .progress i{display:block;height:100%;width:0;background:linear-gradient(90deg,#6366f1,#22d3ee);transition:width .3s}
+          #stage{color:var(--muted);font-size:13px}
+          #renderErr{color:#fca5a5;white-space:pre-wrap;font:12px ui-monospace,monospace;margin:0;max-height:160px;overflow:auto}
+          .outputs{display:grid;gap:6px}
+          .out{display:flex;gap:8px;align-items:center;background:#0b1020;border:1px solid var(--line);border-radius:8px;padding:6px 8px}
+          .out span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+          .out small{color:var(--muted)}
+          .muted{color:var(--muted)}
+          h3{margin:0;font-size:13px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
+          dialog{background:var(--card);color:var(--text);border:1px solid var(--line);border-radius:14px;width:min(860px,94vw);padding:0}
+          dialog::backdrop{background:rgba(0,0,0,.6)}
+          .dh{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;border-bottom:1px solid var(--line)}
+          .db{padding:14px 16px;display:grid;gap:10px}
+          .df{padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end}
+          dialog textarea{width:100%;height:46vh;background:#0b1020;border:1px solid var(--line);border-radius:8px;padding:10px;color:#dbeafe;font:12px/1.5 ui-monospace,monospace}
+          dialog video,dialog img{max-width:100%;max-height:70vh;display:block;margin:auto;background:#000}
+          pre.log{white-space:pre-wrap;font:12px ui-monospace,monospace;background:#070b16;padding:10px;border-radius:8px;max-height:40vh;overflow:auto;margin:0}
+          .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--warn);margin-right:6px}
+          .dot.clean{background:var(--ok)}
+          @media (max-width:1000px){main{display:block;height:auto}.left{border-right:0}#editor{height:60vh}#studioWrap{height:62vh}.render{max-height:none}}
+          </style>
+          </head>
+          <body>
+          <header>
+            <b>Remotion Live Panel</b>
+            <span class="pill" id="timer"></span>
+            <button id="pasteBtn" title="Paste a full AI answer; Root.tsx and Main.tsx are split out automatically">Paste AI answer</button>
+            <button id="ghBtn" hidden>Save to GitHub</button>
+            <a href="/?studio" target="_blank" rel="noopener"><button>Studio full screen ↗</button></a>
+          </header>
+          <main>
+            <section class="col left">
+              <div class="bar">
+                <span class="dot clean" id="dirtyDot" title="Saved"></span>
+                <select id="fileSel" aria-label="File"></select>
+                <button id="newBtn" title="Create a new file in src/">+ File</button>
+                <span class="grow"></span>
+                <button id="checkBtn" title="Run TypeScript strict check">Check code</button>
+                <button class="primary" id="saveBtn" title="Ctrl+S">Save</button>
+              </div>
+              <div id="editor"></div>
+              <pre id="console">Edit a file and press Save (Ctrl+S). Remotion Studio on the right reloads automatically.</pre>
+            </section>
+            <section class="col">
+              <div id="studioWrap"><iframe id="studio" src="/?studio" title="Remotion Studio"></iframe></div>
+              <div class="render">
+                <div class="row" style="justify-content:space-between"><h3>Render MP4</h3><button id="reloadStudio" title="Reload the Studio preview">Reload preview</button></div>
+                <div class="row">
+                  <label>Composition<input type="text" id="comp" value="Main" size="10"></label>
+                  <label>Quality<select id="quality"><option value="best">Best (CRF 16)</option><option value="high" selected>High (CRF 20)</option><option value="small">Small file (CRF 26)</option></select></label>
+                  <label>Size<select id="scale"><option value="1" selected>Full size (from Root.tsx)</option><option value="0.5">Half size (fast check)</option><option value="0.25">Quarter size (fastest)</option><option value="2">2× upscale</option></select></label>
+                  <label style="display:flex;align-items:center;gap:6px;color:var(--text);font-size:13px;margin-top:14px"><input type="checkbox" id="test"> Quick test (first 3 s)</label>
+                </div>
+                <div class="row">
+                  <button class="primary" id="renderBtn">Render ▶</button>
+                  <button class="danger" id="cancelBtn" hidden>Cancel</button>
+                  <span id="stage">Ready.</span>
+                </div>
+                <div class="progress"><i id="bar"></i></div>
+                <pre id="renderErr"></pre>
+                <div class="row">
+                  <label>Snapshot frame<input type="number" id="frame" value="0" min="0" style="width:90px"></label>
+                  <button id="stillBtn" style="margin-top:14px">Snapshot PNG</button>
+                </div>
+                <div class="row" style="justify-content:space-between"><h3>Your files (out/)</h3><button id="refreshOut">Refresh</button></div>
+                <div class="outputs" id="outputs"><span class="muted">No renders yet.</span></div>
+              </div>
+            </section>
+          </main>
+
+          <dialog id="pasteDlg"><div class="dh"><b>Paste AI answer</b><button data-close>×</button></div>
+          <div class="db"><span class="muted">Paste the whole AI reply. Code blocks for Root.tsx and Main.tsx (and any other src/ files) are detected and saved automatically.</span><textarea id="pasteText" spellcheck="false" placeholder="Paste here…"></textarea><pre class="log" id="pasteLog" hidden></pre></div>
+          <div class="df"><button data-close>Close</button><button class="primary" id="pasteGo">Split &amp; save</button></div></dialog>
+
+          <dialog id="ghDlg"><div class="dh"><b>Save code to GitHub</b><button data-close>×</button></div>
+          <div class="db"><span class="muted" id="ghInfo"></span><input type="text" id="ghMsg" placeholder="Commit message (optional)" maxlength="200"><pre class="log" id="ghLog" hidden></pre></div>
+          <div class="df"><button data-close>Close</button><button class="primary" id="ghGo">Commit &amp; push</button></div></dialog>
+
+          <dialog id="viewDlg"><div class="dh"><b id="viewName"></b><button data-close>×</button></div><div class="db" id="viewBody"></div></dialog>
+
+          <script>
+          (function(){
+          'use strict';
+          var $=function(id){return document.getElementById(id);};
+          var MONACO='https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min';
+          var files={},current='',editor=null,info={};
+          function api(path,opt){return fetch('/__panel/api/'+path,opt||{}).then(function(r){return r.json().then(function(j){if(!r.ok&&r.status!==409)throw new Error(j.error||('HTTP '+r.status));return j;});});}
+          function log(t,cls){var c=$('console');c.textContent=t;c.className=cls||'';}
+          function size(n){return n>1048576?(n/1048576).toFixed(1)+' MB':Math.max(1,Math.round(n/1024))+' KB';}
+          function esc(s){return String(s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+
+          // ---------- editor (Monaco, textarea fallback) ----------
+          var ed={get:function(){return ta.value;},set:function(t){ta.value=t;},focus:function(){ta.focus();}};
+          var ta=document.createElement('textarea');ta.spellcheck=false;$('editor').appendChild(ta);
+          ta.addEventListener('input',markDirty);
+          ta.addEventListener('keydown',function(e){if(e.key==='Tab'){e.preventDefault();var s=ta.selectionStart;ta.setRangeText('  ',s,ta.selectionEnd,'end');markDirty();}});
+          function loadMonaco(){
+            window.MonacoEnvironment={getWorkerUrl:function(){return 'data:text/javascript;charset=utf-8,'+encodeURIComponent("self.MonacoEnvironment={baseUrl:'"+MONACO+"/'};importScripts('"+MONACO+"/vs/base/worker/workerMain.js');");}};
+            var s=document.createElement('script');s.src=MONACO+'/vs/loader.js';
+            s.onload=function(){
+              window.require.config({paths:{vs:MONACO+'/vs'}});
+              window.require(['vs/editor/editor.main'],function(){
+                var m=window.monaco,tsd=m.languages.typescript.typescriptDefaults;
+                tsd.setCompilerOptions({jsx:m.languages.typescript.JsxEmit.ReactJSX,target:m.languages.typescript.ScriptTarget.ESNext,allowNonTsExtensions:true,moduleResolution:m.languages.typescript.ModuleResolutionKind.NodeJs});
+                tsd.setDiagnosticsOptions({noSemanticValidation:true,noSyntaxValidation:false});
+                var text=ta.value;ta.remove();
+                editor=m.editor.create($('editor'),{value:text,language:'typescript',theme:'vs-dark',automaticLayout:true,fontSize:13,minimap:{enabled:false},tabSize:2,scrollBeyondLastLine:false,wordWrap:'on'});
+                setModel(current,text);
+                editor.onDidChangeModelContent(markDirty);
+                editor.addCommand(m.KeyMod.CtrlCmd|m.KeyCode.KeyS,save);
+                ed={get:function(){return editor.getValue();},set:function(t){setModel(current,t);},focus:function(){editor.focus();}};
+              });
+            };
+            document.head.appendChild(s);
+          }
+          function setModel(p,t){
+            if(!editor)return;var m=window.monaco,uri=m.Uri.parse('file:///'+(p||'scratch.tsx'));
+            var model=m.editor.getModel(uri);
+            if(!model)model=m.editor.createModel(t,/\.css$/.test(p)?'css':/\.json$/.test(p)?'json':'typescript',uri);
+            else if(model.getValue()!==t)model.setValue(t);
+            editor.setModel(model);
+          }
+          var suppress=false;
+          function markDirty(){if(suppress||!current)return;files[current].text=ed.get();updateDot();}
+          function updateDot(){var f=files[current],d=f&&f.text!==f.saved;$('dirtyDot').className='dot'+(d?'':' clean');$('dirtyDot').title=d?'Unsaved changes':'Saved';
+            [].forEach.call($('fileSel').options,function(o){var x=files[o.value];o.textContent=o.value.replace(/^src\//,'')+(x&&x.text!==x.saved?' •':'');});}
+          function open(p){
+            if(current&&files[current])files[current].text=ed.get();
+            current=p;$('fileSel').value=p;
+            var go=function(){suppress=true;ed.set(files[p].text);suppress=false;updateDot();};
+            if(files[p]&&files[p].text!=null)return go();
+            api('file?path='+encodeURIComponent(p)).then(function(j){files[p]={saved:j.content,text:j.content};go();}).catch(function(e){log(String(e),'bad');});
+          }
+          function listFiles(select){
+            return api('files').then(function(j){
+              var sel=$('fileSel');sel.innerHTML='';
+              var order=function(a){return a==='src/Main.tsx'?0:a==='src/Root.tsx'?1:a==='src/index.ts'?3:2;};
+              j.files.sort(function(a,b){return order(a)-order(b)||a.localeCompare(b);}).forEach(function(f){if(!files[f])files[f]={saved:null,text:null};var o=document.createElement('option');o.value=f;sel.appendChild(o);});
+              updateDot();
+              var target=select||current||(j.files.indexOf('src/Main.tsx')!==-1?'src/Main.tsx':j.files[0]);
+              if(target)open(target);else log('No files in src/ yet. Use "Paste AI answer" or "+ File".');
+            });
+          }
+          function writeFile(p,t){return fetch('/__panel/api/file?path='+encodeURIComponent(p),{method:'PUT',body:t}).then(function(r){return r.json();}).then(function(j){if(!j.ok)throw new Error(j.error||'Save failed');files[p]={saved:t,text:t};});}
+          function save(){
+            if(!current)return;var p=current,t=ed.get();
+            $('saveBtn').disabled=true;
+            writeFile(p,t).then(function(){updateDot();log('Saved '+p+' at '+new Date().toLocaleTimeString()+'. Studio reloads automatically. Press "Check code" for a TypeScript strict check.','ok');})
+            .catch(function(e){log(String(e),'bad');}).then(function(){$('saveBtn').disabled=false;});
+          }
+          $('saveBtn').onclick=save;
+          document.addEventListener('keydown',function(e){if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='s'){e.preventDefault();save();}});
+          $('fileSel').onchange=function(){open(this.value);};
+          $('newBtn').onclick=function(){
+            var n=prompt('New file name inside src/ (for example Scene1.tsx or components/Logo.tsx)');if(!n)return;
+            n='src/'+n.replace(/^\/?(src\/)?/,'').trim();
+            if(!/^[A-Za-z0-9_\-./]+\.(tsx|ts|jsx|js|css|json)$/.test(n)||n.indexOf('..')!==-1)return alert('Use a name like Scene1.tsx');
+            if(files[n]&&files[n].saved!=null)return open(n);
+            writeFile(n,'').then(function(){return listFiles(n);}).catch(function(e){log(String(e),'bad');});
+          };
+          $('checkBtn').onclick=function(){
+            var b=this;b.disabled=true;log('Running TypeScript strict check… (save first; this checks saved files)');
+            api('check',{method:'POST'}).then(function(j){log(j.out,j.ok?'ok':'bad');}).catch(function(e){log(String(e),'bad');}).then(function(){b.disabled=false;});
+          };
+          window.addEventListener('beforeunload',function(e){if(current)files[current].text=ed.get();for(var k in files){if(files[k].text!=null&&files[k].text!==files[k].saved){e.preventDefault();e.returnValue='';return;}}});
+
+          // ---------- paste AI answer ----------
+          function dlg(id){var d=$(id);[].forEach.call(d.querySelectorAll('[data-close]'),function(b){b.onclick=function(){d.close();};});return d;}
+          $('pasteBtn').onclick=function(){$('pasteLog').hidden=true;dlg('pasteDlg').showModal();$('pasteText').focus();};
+          function split(text){
+            var blocks=[],re=/```[^\n`]*\n([\s\S]*?)```/g,m;
+            while((m=re.exec(text)))blocks.push({code:m[1],before:text.slice(Math.max(0,m.index-240),m.index),head:text.slice(m.index,m.index+80)});
+            if(!blocks.length)blocks.push({code:text,before:'',head:''});
+            var out={},skipped=[];
+            blocks.forEach(function(b){
+              var code=b.code.replace(/\s+$/,'')+'\n',name='';
+              var first=code.split('\n').slice(0,3).join('\n');
+              var m1=/(?:\/\/|\/\*)\s*((?:src\/)?[A-Za-z0-9_\-/]+\.(?:tsx|ts|jsx|js|css))/.exec(first)||/((?:src\/)?[A-Za-z0-9_\-/]+\.(?:tsx|ts|jsx|js|css))[^\n]*$/.exec(b.head.split('\n')[0]);
+              if(m1)name=m1[1];
+              if(!name){var all=b.before.match(/(?:src\/)?[A-Za-z0-9_\-]+\.(?:tsx|ts)/g);if(all)name=all[all.length-1];}
+              if(/<Composition[\s>]/.test(code)&&/registerRoot/.test(code)===false&&!/Root\.tsx$/.test(name)&&/export const (RemotionRoot|Root)/.test(code))name='Root.tsx';
+              if(!name&&/<Composition[\s>]/.test(code))name='Root.tsx';
+              if(!name&&/export\s+const\s+Main\b/.test(code))name='Main.tsx';
+              if(!name){skipped.push(code.slice(0,60));return;}
+              name='src/'+name.replace(/^src\//,'');
+              if(/package\.json$/.test(name)){skipped.push(name);return;}
+              out[name]=code;
+            });
+            return {files:out,skipped:skipped};
+          }
+          $('pasteGo').onclick=function(){
+            var r=split($('pasteText').value),names=Object.keys(r.files),L=$('pasteLog');L.hidden=false;
+            if(!names.length){L.textContent='No Remotion code found. Make sure the answer has code blocks for Root.tsx / Main.tsx.';return;}
+            if(names.indexOf('src/index.ts')!==-1&&!confirm('The answer also contains src/index.ts. Overwrite it?'))delete r.files['src/index.ts'];
+            names=Object.keys(r.files);
+            Promise.all(names.map(function(n){return writeFile(n,r.files[n]);})).then(function(){
+              L.textContent='Saved: '+names.join(', ')+(r.skipped.length?'\nSkipped '+r.skipped.length+' block(s) without a file name.':'')+'\nStudio reloads automatically.';
+              log('Saved from AI answer: '+names.join(', '),'ok');
+              current='';return listFiles(names.indexOf('src/Main.tsx')!==-1?'src/Main.tsx':names[0]);
+            }).catch(function(e){L.textContent=String(e);});
+          };
+
+          // ---------- GitHub ----------
+          $('ghBtn').onclick=function(){$('ghLog').hidden=true;$('ghInfo').textContent='Commits my-remotion/src (and package.json / tsconfig.json) to '+info.repo+' on branch '+info.ref+'. Save your files first.';dlg('ghDlg').showModal();};
+          $('ghGo').onclick=function(){
+            var b=this;b.disabled=true;$('ghLog').hidden=false;$('ghLog').textContent='Pushing…';
+            api('commit',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({message:$('ghMsg').value})})
+            .then(function(j){$('ghLog').textContent=(j.ok?'✓ Saved to GitHub.\n\n':'✗ Failed.\n\n')+j.out;}).catch(function(e){$('ghLog').textContent=String(e);}).then(function(){b.disabled=false;});
+          };
+
+          // ---------- render ----------
+          var polling=null;
+          function setBusy(on){$('renderBtn').disabled=on;$('stillBtn').disabled=on;$('cancelBtn').hidden=!on;}
+          function poll(){
+            api('job').then(function(j){
+              var busy=['bundling','preparing','rendering'].indexOf(j.status)!==-1;
+              setBusy(busy);
+              $('bar').style.width=Math.round((j.progress||0)*100)+'%';
+              if(busy){$('stage').textContent=(j.stage||'Working…')+(j.meta?' · '+j.meta:'');}
+              else if(j.status==='done'){$('stage').textContent='✓ Done in '+j.seconds+' s · '+j.file;}
+              else if(j.status==='error'){$('stage').textContent='✗ Render failed';$('renderErr').textContent=j.error||'';}
+              else if(j.status==='cancelled'){$('stage').textContent='Cancelled.';}
+              if(busy&&!polling)polling=setInterval(poll,1000);
+              if(!busy&&polling){clearInterval(polling);polling=null;outputs();}
+            }).catch(function(){});
+          }
+          function startPoll(){if(!polling)polling=setInterval(poll,1000);poll();}
+          $('renderBtn').onclick=function(){
+            if(Object.keys(files).some(function(k){return files[k].text!=null&&files[k].text!==files[k].saved;})&&!confirm('You have unsaved changes. Render the last SAVED version?'))return;
+            $('renderErr').textContent='';$('bar').style.width='0';
+            api('render',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({composition:$('comp').value,quality:$('quality').value,scale:$('scale').value,test:$('test').checked})})
+            .then(function(j){if(j.error){$('stage').textContent=j.error;}startPoll();}).catch(function(e){$('stage').textContent=String(e);});
+          };
+          $('cancelBtn').onclick=function(){api('cancel',{method:'POST'});};
+          $('stillBtn').onclick=function(){
+            var b=this;b.disabled=true;$('renderErr').textContent='';$('stage').textContent='Rendering snapshot…';
+            api('still',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({composition:$('comp').value,frame:$('frame').value})})
+            .then(function(j){if(j.ok){$('stage').textContent='✓ Snapshot of frame '+j.frame;view(j.file);outputs();}else{$('stage').textContent='✗ Snapshot failed';$('renderErr').textContent=j.error||'';}})
+            .catch(function(e){$('stage').textContent=String(e);}).then(function(){b.disabled=false;});
+          };
+          function view(name){
+            var u='/__panel/out/'+encodeURIComponent(name),body=$('viewBody');$('viewName').textContent=name;
+            body.innerHTML=/\.png|\.jpe?g|\.gif$/i.test(name)?'<img alt="" src="'+u+'?t='+Date.now()+'">':'<video controls autoplay loop playsinline src="'+u+'"></video>';
+            body.insertAdjacentHTML('beforeend','<div class="row" style="justify-content:flex-end"><a href="'+u+'?download=1"><button class="primary">Download</button></a></div>');
+            var d=dlg('viewDlg');d.onclose=function(){body.innerHTML='';};d.showModal();
+          }
+          function outputs(){
+            api('outputs').then(function(j){
+              var box=$('outputs');
+              if(!j.files.length){box.innerHTML='<span class="muted">No renders yet.</span>';return;}
+              box.innerHTML=j.files.map(function(f){var u='/__panel/out/'+encodeURIComponent(f.name);return '<div class="out"><span title="'+esc(f.name)+'">'+esc(f.name)+'</span><small>'+size(f.size)+'</small><button data-view="'+esc(f.name)+'">Preview</button><a href="'+u+'?download=1"><button>Download</button></a><button class="danger" data-del="'+esc(f.name)+'" title="Delete">×</button></div>';}).join('');
+            });
+          }
+          $('outputs').onclick=function(e){
+            var t=e.target.closest('button');if(!t)return;
+            if(t.dataset.view)view(t.dataset.view);
+            if(t.dataset.del&&confirm('Delete '+t.dataset.del+'?'))api('delete',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:t.dataset.del})}).then(outputs);
+          };
+          $('refreshOut').onclick=outputs;
+          $('reloadStudio').onclick=function(){$('studio').src='/?studio&t='+Date.now();};
+
+          // ---------- session timer ----------
+          function tick(){
+            if(!info.sessionEnd){$('timer').textContent='';return;}
+            var s=Math.max(0,Math.round(info.sessionEnd-Date.now()/1000)),h=Math.floor(s/3600),m=Math.floor(s%3600/60);
+            $('timer').textContent=s?('Session ends in '+(h?h+'h ':'')+m+'m'):'Session ended';
+            $('timer').style.color=s<900?'#fbbf24':'';
+          }
+          api('info').then(function(j){info=j;$('ghBtn').hidden=!j.github;tick();setInterval(tick,15000);});
+          listFiles();outputs();poll();loadMonaco();
+          })();
+          </script>
+          </body>
+          </html>
+          PANEL_HTML_EOF
+          node --check "$RUNNER_TEMP/panel/server.mjs"
+
+      - name: Start Remotion Live Panel session
+        if: ${{ inputs.mode == 'studio' }}
+        working-directory: my-remotion
         env:
           SESSION_MINUTES: ${{ inputs.minutes }}
+          PANEL_PASSWORD: ${{ secrets.PANEL_PASSWORD }}
         run: |
           set -euo pipefail
           case "$SESSION_MINUTES" in 30|60|330) ;; *) exit 1 ;; esac
-          PREVIEW_PID=''
+          STUDIO_PID=''
+          PANEL_PID=''
           TUNNEL_PID=''
           cleanup() {
             [[ -z "$TUNNEL_PID" ]] || kill "$TUNNEL_PID" 2>/dev/null || true
-            [[ -z "$PREVIEW_PID" ]] || kill "$PREVIEW_PID" 2>/dev/null || true
+            [[ -z "$PANEL_PID" ]] || kill "$PANEL_PID" 2>/dev/null || true
+            [[ -z "$STUDIO_PID" ]] || kill "$STUDIO_PID" 2>/dev/null || true
           }
           trap cleanup EXIT
           trap 'exit 130' INT
           trap 'exit 143' TERM
 
-          hyperframes preview "$PROJECT_DIR" --port 3002 --no-open --foreground \
-            > "$RUNNER_TEMP/hyperframes.log" 2>&1 &
-          PREVIEW_PID=$!
+          # Remotion Studio (preview) runs on 3001; the Live Panel on 3000 shows it.
+          npx remotion studio src/index.ts --port 3001 --no-open \
+            > "$RUNNER_TEMP/studio.log" 2>&1 &
+          STUDIO_PID=$!
 
           READY=false
           for attempt in $(seq 1 90); do
-            if curl --fail --silent http://127.0.0.1:3002/ > /dev/null; then
+            if curl --fail --silent http://127.0.0.1:3001/ > /dev/null; then
               READY=true
               break
             fi
-            if ! kill -0 "$PREVIEW_PID" 2>/dev/null; then break; fi
+            if ! kill -0 "$STUDIO_PID" 2>/dev/null; then break; fi
             sleep 2
           done
           if [[ "$READY" != true ]]; then
-            tail -n 80 "$RUNNER_TEMP/hyperframes.log"
-            echo '::error::HyperFrames did not start.'
+            tail -n 80 "$RUNNER_TEMP/studio.log"
+            echo '::error::Remotion Studio did not start. Check the log above for code errors.'
+            exit 1
+          fi
+
+          SESSION_END=$(( $(date +%s) + SESSION_MINUTES * 60 ))
+          PROJECT_DIR="$PWD" PANEL_PORT=3000 STUDIO_PORT=3001 SESSION_END="$SESSION_END" \
+            node "$RUNNER_TEMP/panel/server.mjs" > "$RUNNER_TEMP/panel.log" 2>&1 &
+          PANEL_PID=$!
+
+          READY=false
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:3000/__panel/health > /dev/null; then
+              READY=true
+              break
+            fi
+            if ! kill -0 "$PANEL_PID" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          if [[ "$READY" != true ]]; then
+            tail -n 60 "$RUNNER_TEMP/panel.log"
+            echo '::error::The Live Panel did not start.'
             exit 1
           fi
 
           "$RUNNER_TEMP/cloudflared" tunnel --no-autoupdate --protocol http2 \
-            --url http://127.0.0.1:3002 \
+            --url http://127.0.0.1:3000 \
             > "$RUNNER_TEMP/cloudflared.log" 2>&1 &
           TUNNEL_PID=$!
 
@@ -139,44 +913,66 @@ jobs:
             exit 1
           fi
 
-          EDITOR_URL="$PUBLIC_URL/#project/my-video"
-          echo "Open HyperFrames: $EDITOR_URL"
+          # Wait until the tunnel is registered AND the public URL really answers.
+          # Opening the link too early makes browsers/ISPs cache "DNS not found".
+          echo 'Waiting for the public link to go live (up to 3 minutes)...'
+          LIVE=false
+          for attempt in $(seq 1 36); do
+            if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then break; fi
+            if grep -q 'Registered tunnel connection' "$RUNNER_TEMP/cloudflared.log"; then
+              CODE=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+                --max-time 15 --doh-url https://1.1.1.1/dns-query \
+                "$PUBLIC_URL/__panel/health" || true)
+              if [[ "$CODE" == 200 ]]; then LIVE=true; break; fi
+            fi
+            sleep 5
+          done
+          if [[ "$LIVE" != true ]]; then
+            echo '::error::The Cloudflare link never became reachable. Re-run the workflow.'
+            tail -n 40 "$RUNNER_TEMP/cloudflared.log"
+            exit 1
+          fi
+
+          if [[ -n "$PANEL_PASSWORD" ]]; then
+            LOCK='Password protected: use your PANEL_PASSWORD secret.'
+          else
+            LOCK='No password set: anyone with this link can open it, so do not share it. Add a PANEL_PASSWORD repository secret to lock it.'
+          fi
+          echo "Open Remotion Live Panel: $PUBLIC_URL"
+          echo "$LOCK"
           {
-            echo '## HyperFrames browser editor'
+            echo '## Remotion Live Panel'
             echo
-            echo "[Open your editor]($EDITOR_URL)"
+            echo "[Open Remotion Live Panel]($PUBLIC_URL)"
             echo
-            echo 'No login is required. Anyone with this link can open the editor, so do not share it.'
+            echo "$LOCK"
             echo
-            echo "Session duration: $SESSION_MINUTES minutes after startup. Allow a few seconds for the tunnel to connect."
+            echo "Session duration: $SESSION_MINUTES minutes after startup."
             echo
-            echo 'This is browser Studio, not the native Framey desktop app.'
-            echo 'At normal completion, download the hyperframes-project artifact to keep your files.'
-            echo 'Cancelling the run can prevent the artifact from uploading. Download important work first.'
+            echo 'Edit or paste code, Save, watch Studio update, then Render and Download the MP4 on the same page. Your src/ code and out/ renders are saved in the remotion-output artifact when the session ends.'
           } >> "$GITHUB_STEP_SUMMARY"
 
-          DEADLINE=$((SECONDS + SESSION_MINUTES * 60))
-          while (( SECONDS < DEADLINE )); do
-            if ! kill -0 "$PREVIEW_PID" 2>/dev/null || ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-              echo '::error::The editor or tunnel stopped unexpectedly.'
-              tail -n 60 "$RUNNER_TEMP/hyperframes.log"
+          while (( $(date +%s) < SESSION_END )); do
+            if ! kill -0 "$STUDIO_PID" 2>/dev/null || ! kill -0 "$PANEL_PID" 2>/dev/null || ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+              echo '::error::Remotion Studio, the panel or the tunnel stopped unexpectedly.'
+              tail -n 60 "$RUNNER_TEMP/studio.log"
+              tail -n 40 "$RUNNER_TEMP/panel.log"
               tail -n 40 "$RUNNER_TEMP/cloudflared.log"
               exit 1
             fi
             sleep 10
           done
 
-      - name: Save project files
+      - name: Save rendered videos and project files
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: hyperframes-project-${{ github.run_id }}
+          name: remotion-output-${{ github.run_id }}
           path: |
-            my-video/
-            !my-video/**/node_modules/**
-            !my-video/**/.cache/**
-            !my-video/**/.env*
-            !my-video/**/credentials*
+            my-remotion/
+            !my-remotion/node_modules/**
+            !my-remotion/**/.cache/**
+            !my-remotion/**/.env*
           include-hidden-files: false
           if-no-files-found: warn
           retention-days: 3
